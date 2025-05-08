@@ -1,0 +1,524 @@
+/*
+  Smart Cane System with Two-Way Communication for Object Detection
+  
+  This version:
+  1. Detects obstacles with ultrasonic sensors
+  2. Sends trigger to Python script
+  3. Receives feedback about detected objects
+  4. Plays specific sounds based on detected objects
+*/
+
+#include <Arduino.h>
+#include <HardwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+
+// Constants for ultrasonic sensors
+#define LEFT_TRIG_PIN 23
+#define LEFT_ECHO_PIN 12
+#define RIGHT_TRIG_PIN 5
+#define RIGHT_ECHO_PIN 19
+#define MAX_DISTANCE 200       // Maximum distance in centimeters
+#define OBSTACLE_THRESHOLD 50  // Distance in cm to trigger alert (notify when obstacle closer than 50cm)
+
+// Constants for sensor filtering
+#define READINGS_PER_SENSOR 5  // Number of readings to take for median filtering
+#define READING_DELAY 20       // Delay between readings in ms
+
+// Constants for MP3 player
+#define MP3_RX_PIN 27  // Connect to DFPlayer TX
+#define MP3_TX_PIN 26  // Connect to DFPlayer RX
+
+// Sound file numbers on SD card
+#define SOUND_LEFT_OBSTACLE 1  // File: 001.mp3 for left obstacle
+#define SOUND_RIGHT_OBSTACLE 2 // File: 002.mp3 for right obstacle
+#define SOUND_PERSON 3         // File: 003.mp3 for person detection
+#define SOUND_CAR 4            // File: 004.mp3 for car detection
+#define SOUND_GENERIC 5        // File: 005.mp3 for other objects
+
+// WiFi settings - update with your WiFi credentials
+const char* ssid = "iheb";      // Replace with your WiFi network name
+const char* password = "iheb123456789"; // Replace with your WiFi password
+
+// Python script trigger settings
+const char* triggerUrl = "http://192.168.100.201:5000/trigger"; // Replace with your computer's IP and port
+
+// Create a web server for receiving detection results
+WebServer server(80);
+
+// Create instance for MP3 player
+HardwareSerial mp3Serial(2); // Use UART2 for MP3 player
+DFRobotDFPlayerMini mp3Player;
+bool mp3PlayerWorking = false;
+bool wifiConnected = false;
+
+// Variables to store sensor readings
+float leftDistances[READINGS_PER_SENSOR];
+float rightDistances[READINGS_PER_SENSOR];
+float filteredLeftDistance = 0;
+float filteredRightDistance = 0;
+unsigned long lastLeftAlert = 0;
+unsigned long lastRightAlert = 0;
+unsigned long lastDisplayTime = 0;
+unsigned long cameraPauseStart = 0;
+bool cameraPaused = false;
+const unsigned long ALERT_INTERVAL = 2000; // Minimum time between alerts in milliseconds
+const unsigned long DISPLAY_INTERVAL = 500; // Display readings every 500ms
+const unsigned long CAMERA_DURATION = 10000; // Duration for camera processing
+
+// Variable to store detected object
+String detectedObject = "";
+bool newDetection = false;
+
+// Function prototypes
+void printDetail(uint8_t type, int value);
+float readUltrasonicDistance(int trigPin, int echoPin);
+float getMedianValue(float values[], int size);
+void readAndFilterSensors();
+void checkObstacles();
+void connectToWiFi();
+bool sendTriggerToPython(String direction);
+void checkCameraPauseTimeout();
+void setupServer();
+void handleObjectDetection();
+int getObjectSoundID(String objectName);
+
+void setup() {
+  // Initialize Serial for debugging
+  Serial.begin(115200);
+  Serial.println("\n\nSmart Cane System Initializing...");
+  
+  // Initialize ultrasonic sensor pins
+  pinMode(LEFT_TRIG_PIN, OUTPUT);
+  pinMode(LEFT_ECHO_PIN, INPUT);
+  pinMode(RIGHT_TRIG_PIN, OUTPUT);
+  pinMode(RIGHT_ECHO_PIN, INPUT);
+  
+  // Ensure trigger pins start LOW
+  digitalWrite(LEFT_TRIG_PIN, LOW);
+  digitalWrite(RIGHT_TRIG_PIN, LOW);
+  
+  Serial.println("Ultrasonic sensors initialized");
+  
+  // Initialize MP3 player with retry mechanism
+  mp3Serial.begin(9600, SERIAL_8N1, MP3_RX_PIN, MP3_TX_PIN);
+  Serial.println("Initializing MP3 player...");
+  
+  delay(2000); // Give MP3 player more time to initialize
+  
+  int retries = 0;
+  while (!mp3Player.begin(mp3Serial)) {
+    Serial.println("Failed to initialize MP3 player, retrying...");
+    delay(1000);
+    retries++;
+    
+    if (retries >= 5) {
+      Serial.println("Unable to begin MP3 player after multiple attempts. Check connections and SD card.");
+      Serial.println("Continuing without audio alerts...");
+      mp3PlayerWorking = false;
+      break;
+    }
+  }
+  
+  if (retries < 5) {
+    mp3PlayerWorking = true;
+    mp3Player.setTimeOut(500);
+    mp3Player.volume(30);  // Set maximum volume (0-30)
+    mp3Player.EQ(DFPLAYER_EQ_NORMAL);
+    mp3Player.outputDevice(DFPLAYER_DEVICE_SD);
+    
+    // Check for SD card and files
+    int fileCount = mp3Player.readFileCounts();
+    if (fileCount > 0) {
+      Serial.print("Files found on SD card: ");
+      Serial.println(fileCount);
+    } else {
+      Serial.println("⚠️ No files found on SD card!");
+      Serial.println("Please check that your SD card:");
+      Serial.println("1. Is inserted correctly");
+      Serial.println("2. Is formatted as FAT32");
+      Serial.println("3. Has files named 001.mp3, 002.mp3, 003.mp3, etc. in the root directory");
+    }
+    
+    // Reset the module to ensure it reads the files correctly
+    mp3Player.reset();
+    delay(1500);
+    
+    Serial.println("MP3 player initialized successfully");
+    
+    // Test playing obstacle sounds
+    Serial.println("Testing left obstacle sound (001.mp3)...");
+    mp3Player.play(SOUND_LEFT_OBSTACLE);
+    delay(3000); // Give time for sound to play
+    
+    Serial.println("Testing right obstacle sound (002.mp3)...");
+    mp3Player.play(SOUND_RIGHT_OBSTACLE);
+    delay(3000); // Give time for sound to play
+  }
+  
+  // Initialize WiFi after all other hardware is working
+  Serial.println("Initializing WiFi...");
+  connectToWiFi();
+  
+  // Setup web server to receive detection results
+  if (wifiConnected) {
+    setupServer();
+  }
+  
+  Serial.println("\nSmart Cane System is ready!");
+  Serial.println("Using detection threshold: " + String(OBSTACLE_THRESHOLD) + " cm");
+  Serial.println("Using alert interval: " + String(ALERT_INTERVAL/1000) + " seconds");
+  Serial.println("----------------------------------");
+}
+
+void loop() {
+  // Handle incoming client requests
+  if (wifiConnected) {
+    server.handleClient();
+  }
+  
+  // Check if camera pause is active and if its time is up
+  checkCameraPauseTimeout();
+  
+  // Check if there's a new object detection to announce
+  if (newDetection && mp3PlayerWorking) {
+    int soundID = getObjectSoundID(detectedObject);
+    if (soundID > 0) {
+      Serial.print("Playing sound for detected object: ");
+      Serial.println(detectedObject);
+      mp3Player.play(soundID);
+    }
+    newDetection = false;
+  }
+  
+  if (!cameraPaused) {
+    // Read ultrasonic sensors with filtering
+    readAndFilterSensors();
+    
+    // Print distances to serial monitor at regular intervals
+    if (millis() - lastDisplayTime >= DISPLAY_INTERVAL) {
+      Serial.print("LEFT: ");
+      Serial.print(filteredLeftDistance);
+      Serial.print(" cm | RIGHT: ");
+      Serial.print(filteredRightDistance);
+      Serial.println(" cm");
+      lastDisplayTime = millis();
+    }
+    
+    // Check for obstacles and trigger alerts
+    checkObstacles();
+  }
+  
+  // Check for MP3 player feedback
+  if (mp3PlayerWorking && mp3Player.available()) {
+    printDetail(mp3Player.readType(), mp3Player.read());
+  }
+  
+  // Small delay between loops
+  delay(50);
+}
+
+// Setup web server endpoints
+void setupServer() {
+  // Set up endpoint for receiving detected objects
+  server.on("/detection", HTTP_GET, handleObjectDetection);
+  
+  // Start the server
+  server.begin();
+  Serial.println("Web server started. Listening for detection results.");
+  Serial.print("ESP32 IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// Handler for object detection endpoint
+void handleObjectDetection() {
+  if (server.hasArg("object")) {
+    detectedObject = server.arg("object");
+    newDetection = true;
+    
+    Serial.print("Received object detection: ");
+    Serial.println(detectedObject);
+    
+    server.send(200, "text/plain", "Detection received: " + detectedObject);
+  } else {
+    server.send(400, "text/plain", "Missing object parameter");
+  }
+}
+
+// Map object names to sound file IDs
+int getObjectSoundID(String objectName) {
+  // Convert to lowercase for case-insensitive comparison
+  objectName.toLowerCase();
+  
+  if (objectName == "person") {
+    return SOUND_PERSON; // 003.mp3
+  } else if (objectName == "car") {
+    return SOUND_CAR;    // 004.mp3
+  } else if (objectName.length() > 0) {
+    return SOUND_GENERIC; // 005.mp3 for other detected objects
+  }
+  
+  return 0; // No sound to play
+}
+
+// Connect to WiFi network
+void connectToWiFi() {
+  WiFi.mode(WIFI_STA); // Set WiFi to station mode
+  WiFi.begin(ssid, password);
+  
+  Serial.print("Connecting to WiFi");
+  
+  // Try to connect with timeout
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout < 20) {
+    delay(500);
+    Serial.print(".");
+    timeout++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    wifiConnected = true;
+  } else {
+    Serial.println();
+    Serial.println("Failed to connect to WiFi. Python trigger will be disabled.");
+    wifiConnected = false;
+  }
+}
+
+// Send trigger to Python script
+bool sendTriggerToPython(String direction) {
+  if (!wifiConnected) {
+    Serial.println("WiFi not connected. Cannot send trigger to Python script.");
+    return false;
+  }
+  
+  HTTPClient http;
+  
+  // Append direction parameter to URL
+  String fullUrl = String(triggerUrl) + "?direction=" + direction + "&esp32_ip=" + WiFi.localIP().toString();
+  http.begin(fullUrl);
+  
+  Serial.println("Sending trigger to Python script...");
+  int httpResponseCode = http.GET();
+  
+  if (httpResponseCode > 0) {
+    Serial.print("Trigger sent! Response code: ");
+    Serial.println(httpResponseCode);
+    String response = http.getString();
+    Serial.println("Response: " + response);
+    http.end();
+    return true;
+  } else {
+    Serial.print("Error sending trigger. Error code: ");
+    Serial.println(httpResponseCode);
+    http.end();
+    return false;
+  }
+}
+
+// Check if camera pause has timed out
+void checkCameraPauseTimeout() {
+  if (cameraPaused && (millis() - cameraPauseStart >= CAMERA_DURATION)) {
+    Serial.println("Camera processing time complete. Resuming ultrasonic detection...");
+    cameraPaused = false;
+  }
+}
+
+// Read and filter both sensors
+void readAndFilterSensors() {
+  // Read left sensor multiple times
+  for (int i = 0; i < READINGS_PER_SENSOR; i++) {
+    leftDistances[i] = readUltrasonicDistance(LEFT_TRIG_PIN, LEFT_ECHO_PIN);
+    delay(READING_DELAY); // Small delay between readings
+  }
+  
+  // Read right sensor multiple times
+  for (int i = 0; i < READINGS_PER_SENSOR; i++) {
+    rightDistances[i] = readUltrasonicDistance(RIGHT_TRIG_PIN, RIGHT_ECHO_PIN);
+    delay(READING_DELAY); // Small delay between readings
+  }
+  
+  // Apply median filter to remove outliers
+  filteredLeftDistance = getMedianValue(leftDistances, READINGS_PER_SENSOR);
+  filteredRightDistance = getMedianValue(rightDistances, READINGS_PER_SENSOR);
+}
+
+// Read distance from ultrasonic sensor
+float readUltrasonicDistance(int trigPin, int echoPin) {
+  // Clear the trigger pin
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  
+  // Send a 10μs pulse to trigger
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  // Read the echo pin, returns the sound wave travel time in microseconds
+  long duration = pulseIn(echoPin, HIGH, 30000); // Timeout after 30ms
+  
+  // Calculate distance in centimeters
+  // Speed of sound is 343 m/s or 0.0343 cm/µs
+  // Divide by 2 because sound travels to object and back
+  float distance = duration * 0.0343 / 2;
+  
+  // Constrain to valid range
+  if (distance > MAX_DISTANCE || distance <= 0) {
+    distance = MAX_DISTANCE;
+  }
+  
+  return distance;
+}
+
+// Get median value from an array to filter out outliers
+float getMedianValue(float values[], int size) {
+  // Create a copy of the array
+  float tempValues[size];
+  for (int i = 0; i < size; i++) {
+    tempValues[i] = values[i];
+  }
+  
+  // Sort the array
+  for (int i = 0; i < size - 1; i++) {
+    for (int j = 0; j < size - i - 1; j++) {
+      if (tempValues[j] > tempValues[j + 1]) {
+        // Swap
+        float temp = tempValues[j];
+        tempValues[j] = tempValues[j + 1];
+        tempValues[j + 1] = temp;
+      }
+    }
+  }
+  
+  // Return the middle value
+  if (size % 2 == 0) {
+    // If even number of elements, average the two middle values
+    return (tempValues[size / 2 - 1] + tempValues[size / 2]) / 2.0;
+  } else {
+    // If odd number of elements, return the middle value
+    return tempValues[size / 2];
+  }
+}
+
+// Check for obstacles and trigger sound alerts
+void checkObstacles() {
+  unsigned long currentMillis = millis();
+  bool obstacleDetected = false;
+  String direction = "";
+  
+  // Check left obstacle
+  if (filteredLeftDistance < OBSTACLE_THRESHOLD) {
+    // Only alert if enough time has passed since the last alert
+    if (currentMillis - lastLeftAlert > ALERT_INTERVAL) {
+      Serial.print("⚠️ OBSTACLE DETECTED ON LEFT! Distance: ");
+      Serial.print(filteredLeftDistance);
+      Serial.println(" cm");
+      
+      // Play the left obstacle sound if MP3 player is working
+      if (mp3PlayerWorking) {
+        mp3Player.play(SOUND_LEFT_OBSTACLE);
+        Serial.println("Playing 'Obstacle in left' sound (001.mp3)");
+      }
+      lastLeftAlert = currentMillis;
+      obstacleDetected = true;
+      direction = "left";
+    }
+  }
+  
+  // Check right obstacle
+  if (filteredRightDistance < OBSTACLE_THRESHOLD) {
+    // Only alert if enough time has passed since the last alert
+    if (currentMillis - lastRightAlert > ALERT_INTERVAL) {
+      Serial.print("⚠️ OBSTACLE DETECTED ON RIGHT! Distance: ");
+      Serial.print(filteredRightDistance);
+      Serial.println(" cm");
+      
+      // Play the right obstacle sound if MP3 player is working
+      if (mp3PlayerWorking) {
+        mp3Player.play(SOUND_RIGHT_OBSTACLE);
+        Serial.println("Playing 'Obstacle in right' sound (002.mp3)");
+      }
+      lastRightAlert = currentMillis;
+      obstacleDetected = true;
+      
+      // If left was already detected, set to "both"
+      direction = direction.isEmpty() ? "right" : "both";
+    }
+  }
+  
+  // If obstacle detected, trigger Python script and pause
+  if (obstacleDetected && !cameraPaused && wifiConnected) {
+    Serial.println("Sending trigger to Python script for camera processing...");
+    
+    // Send trigger to Python
+    if (sendTriggerToPython(direction)) {
+      // Pause ultrasonic detection while camera is processing
+      cameraPaused = true;
+      cameraPauseStart = millis();
+      Serial.println("Pausing ultrasonic detection for " + String(CAMERA_DURATION/1000) + " seconds...");
+    }
+  }
+}
+
+// Print detailed error messages
+void printDetail(uint8_t type, int value) {
+  switch (type) {
+    case TimeOut:
+      Serial.println(F("Time Out!"));
+      break;
+    case WrongStack:
+      Serial.println(F("Stack Wrong!"));
+      break;
+    case DFPlayerCardInserted:
+      Serial.println(F("Card Inserted!"));
+      break;
+    case DFPlayerCardRemoved:
+      Serial.println(F("Card Removed!"));
+      break;
+    case DFPlayerCardOnline:
+      Serial.println(F("Card Online!"));
+      break;
+    case DFPlayerPlayFinished:
+      Serial.print(F("File "));
+      Serial.print(value);
+      Serial.println(F(" Play Finished!"));
+      break;
+    case DFPlayerError:
+      Serial.print(F("DFPlayerError:"));
+      switch (value) {
+        case Busy:
+          Serial.println(F("Card not found"));
+          break;
+        case Sleeping:
+          Serial.println(F("Sleeping"));
+          break;
+        case SerialWrongStack:
+          Serial.println(F("Get Wrong Stack"));
+          break;
+        case CheckSumNotMatch:
+          Serial.println(F("Check Sum Not Match"));
+          break;
+        case FileIndexOut:
+          Serial.println(F("File Index Out of Bound"));
+          break;
+        case FileMismatch:
+          Serial.println(F("Cannot Find File"));
+          break;
+        case Advertise:
+          Serial.println(F("In Advertise"));
+          break;
+        default:
+          Serial.println(F("Unknown error"));
+          break;
+      }
+      break;
+    default:
+      break;
+  }
+}
