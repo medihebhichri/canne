@@ -1,0 +1,292 @@
+import cv2
+from ultralytics import YOLO
+import time
+import urllib.request
+import numpy as np
+from flask import Flask, request, jsonify
+import threading
+import requests
+import folium
+import webbrowser
+from datetime import datetime
+import os
+
+# Initialize Flask app for receiving triggers from ESP32
+app = Flask(__name__)
+
+# Global variables
+processing_active = False
+detection_duration = 10  # seconds
+esp32_ip = None
+
+# GPS variables
+gps_lat = None
+gps_lng = None
+gps_status = "unknown"
+last_gps_update = None
+gps_map = None
+
+# Load YOLO model
+print("Loading YOLO model...")
+model = YOLO('best.pt')
+model.conf = 0.3  # Lower threshold to catch more detections
+
+# ESP32 camera URL
+camera_url = "http://192.168.137.89/capture"
+
+
+# Function to get a frame from the ESP32-CAM
+def get_esp32_frame():
+    try:
+        img_resp = urllib.request.urlopen(camera_url)
+        img_np = np.array(bytearray(img_resp.read()), dtype=np.uint8)
+        frame = cv2.imdecode(img_np, -1)
+        return True, frame
+    except Exception as e:
+        print(f"Error capturing frame: {e}")
+        return False, None
+
+
+# Function to send detection to ESP32
+def send_detection_to_esp32(object_name):
+    if not esp32_ip:
+        print("ESP32 IP address not available")
+        return False
+
+    # Convert stop sign format
+    if object_name == "stop sign":
+        object_name = "stop_sign"
+
+    # Send to ESP32
+    url = f"http://{esp32_ip}/detection?object={object_name}"
+    try:
+        print(f"Sending detection '{object_name}' to ESP32 at {url}")
+        response = requests.get(url, timeout=3)
+        print(f"Response: {response.status_code} - {response.text}")
+        return True
+    except Exception as e:
+        print(f"Error sending detection: {e}")
+        return False
+
+
+# Route to receive triggers from ESP32
+@app.route('/trigger', methods=['GET'])
+def trigger_detection():
+    global processing_active, esp32_ip
+
+    # Get the ESP32's IP address
+    esp32_ip = request.args.get('esp32_ip', None)
+    direction = request.args.get('direction', 'unknown')
+
+    print(f"Received trigger from ESP32. Direction: {direction}, IP: {esp32_ip}")
+
+    # If already active, just return
+    if processing_active:
+        return jsonify({"status": "Detection already running"})
+
+    # Start detection in a new thread
+    processing_active = True
+    threading.Thread(target=run_detection).start()
+
+    return jsonify({"status": "Detection started"})
+
+
+# Route to receive GPS data from ESP32
+@app.route('/gps', methods=['GET'])
+def receive_gps_data():
+    global gps_lat, gps_lng, gps_status, last_gps_update, gps_map
+
+    status = request.args.get('status', 'unknown')
+    gps_status = status
+    last_gps_update = datetime.now()
+
+    if status == 'valid':
+        try:
+            lat = float(request.args.get('lat', '0.0'))
+            lng = float(request.args.get('lng', '0.0'))
+            gps_lat = lat
+            gps_lng = lng
+
+            print(f"Received valid GPS coordinates: {lat}, {lng}")
+
+            # Update the map with new position
+            update_map(lat, lng)
+        except Exception as e:
+            print(f"Error processing GPS data: {e}")
+            return jsonify({"status": "error", "message": str(e)})
+    else:
+        print("Received invalid GPS status")
+
+    return jsonify({"status": "success"})
+
+
+# Create or update a map with the GPS position
+def update_map(lat, lng):
+    global gps_map
+
+    # Create a map centered at the coordinates
+    if gps_map is None:
+        gps_map = folium.Map(location=[lat, lng], zoom_start=16)
+
+    # Add a marker for the current position
+    folium.Marker(
+        [lat, lng],
+        popup=f"Smart Cane<br>Lat: {lat}<br>Lng: {lng}<br>Time: {datetime.now().strftime('%H:%M:%S')}",
+        icon=folium.Icon(color='red', icon='info-sign')
+    ).add_to(gps_map)
+
+    # Save the map to an HTML file
+    map_file = "smart_cane_location.html"
+    gps_map.save(map_file)
+
+    # Open the map in a browser if it's the first update
+    if gps_map is None:
+        try:
+            webbrowser.open('file://' + os.path.realpath(map_file))
+        except Exception as e:
+            print(f"Could not open map in browser: {e}")
+
+
+# The main detection function
+def run_detection():
+    global processing_active, gps_lat, gps_lng, gps_status
+
+    print("Starting object detection session...")
+
+    # List of objects we want to detect
+    objects_to_detect = ["person", "car", "stop sign", "stairs"]
+
+    # Track what we've found
+    found_objects = set()
+
+    # Create window for display
+    cv2.namedWindow("Object Detection", cv2.WINDOW_NORMAL)
+
+    # Detection loop
+    start_time = time.time()
+    while processing_active and (time.time() - start_time < detection_duration):
+        # Get frame from camera
+        ret, frame = get_esp32_frame()
+        if not ret or frame is None:
+            print("Failed to get frame, retrying...")
+            time.sleep(0.5)
+            continue
+
+        # Run YOLO detection on frame
+        results = model(frame)
+
+        # Print raw detection results for debugging
+        print(f"Detection result has {len(results)} items")
+
+        # Go through each detection result
+        for result in results:
+            # Print number of detections
+            num_detections = len(result.boxes)
+            print(f"Found {num_detections} objects in frame")
+
+            # Extract all class names from this result
+            names = []
+            if num_detections > 0:
+                # Get class IDs
+                class_ids = result.boxes.cls.cpu().numpy()
+                # Convert each ID to a name
+                for class_id in class_ids:
+                    class_name = result.names[int(class_id)]
+                    names.append(class_name)
+
+                    # Print every detection for debugging
+                    print(f"Detected: {class_name}")
+
+                    # If it's an object we care about and haven't seen yet
+                    if class_name in objects_to_detect and class_name not in found_objects:
+                        print(f"NEW OBJECT FOUND: {class_name.upper()}")
+                        send_detection_to_esp32(class_name)
+                        found_objects.add(class_name)
+
+        # Display the frame with annotations
+        if len(results) > 0:
+            annotated_frame = results[0].plot()
+
+            # Add overlay information
+            remaining = max(0, detection_duration - (time.time() - start_time))
+            cv2.putText(annotated_frame, f"Time: {remaining:.1f}s", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+            # Display found objects
+            y_pos = 70
+            for obj in found_objects:
+                cv2.putText(annotated_frame, f"Found: {obj}", (10, y_pos),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                y_pos += 40
+
+            # Display GPS information
+            y_pos = 70
+            if gps_status == "valid" and gps_lat is not None and gps_lng is not None:
+                gps_text = f"GPS: {gps_lat:.6f}, {gps_lng:.6f}"
+                cv2.putText(annotated_frame, gps_text, (annotated_frame.shape[1] - 400, y_pos),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            else:
+                cv2.putText(annotated_frame, "GPS: Signal not found", (annotated_frame.shape[1] - 400, y_pos),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            if last_gps_update:
+                time_diff = (datetime.now() - last_gps_update).total_seconds()
+                time_text = f"Last update: {time_diff:.1f}s ago"
+                cv2.putText(annotated_frame, time_text, (annotated_frame.shape[1] - 400, y_pos + 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+            # Display the frame
+            cv2.imshow("Object Detection", annotated_frame)
+
+        # Check for exit key
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Clean up
+    cv2.destroyAllWindows()
+    processing_active = False
+
+    # Print summary
+    print("Detection session completed")
+    if found_objects:
+        print(f"DETECTED OBJECTS: {', '.join(found_objects)}")
+    else:
+        print("NO OBJECTS DETECTED")
+
+    if gps_status == "valid":
+        print(f"CURRENT LOCATION: {gps_lat:.6f}, {gps_lng:.6f}")
+    else:
+        print("GPS SIGNAL NOT FOUND")
+
+
+# Initialize a basic map
+def init_map():
+    global gps_map
+    # Create an initial map centered at a default location (will be updated with real coordinates)
+    gps_map = folium.Map(location=[0, 0], zoom_start=2)
+    gps_map.save("smart_cane_location.html")
+    print("Initial map created")
+
+
+# Main function
+def main():
+    # Initialize map
+    init_map()
+
+    # Start Flask server in a separate thread
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False)).start()
+
+    print("Server started at http://0.0.0.0:5000/")
+    print("Waiting for triggers from ESP32...")
+    print("GPS tracking is active. Map will be updated when coordinates are received.")
+
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Program terminated")
+
+
+if __name__ == "__main__":
+    main()
